@@ -1,0 +1,27 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.env
+venv/
+.venv/
+
+# Generated netlist output
+*.net
+*.xml
+
+# KiCad
+*.kicad_pcb
+*.kicad_pro
+*.kicad_sch
+*.bak
+fp-info-cache
+_autosave-*
+
+# pytest
+.pytest_cache/
+.coverage
+htmlcov/
+
+# macOS
+.DS_Store
