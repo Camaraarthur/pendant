@@ -956,7 +956,7 @@ Violating any of them breaks the product.
 | U4 | TPS63031DSKR | WSON-10 | Digi-Key / Mouser | ~$2.50 |
 | M1 | IM73D122V01 | Bottom-port MEMS | Digi-Key / Mouser | ~$1.50 |
 | Q1, Q2 | BSS84 (PMOS) | SOT-23 | LCSC | ~$0.03 ea |
-| D1–D8 | WS2812B | PLCC-4 | LCSC | ~$0.05 ea |
+| D1–D8 | SK6805-EC15 (or WS2812C-2020-V1) | 1515 (1.5mm) / 2020 (2.0mm) | LCSC | ~$0.05 ea |
 | J1 | USB-C receptacle (HRO TYPE-C-31-M-12) | SMD | LCSC | ~$0.15 |
 | J2 | JST SH 1×02 | 1.0 mm pitch | LCSC | ~$0.08 |
 | L1 | 2.2 µH inductor (Isat ≥ 1.5 A) | 2520 / 6332 | Digi-Key | ~$0.30 |

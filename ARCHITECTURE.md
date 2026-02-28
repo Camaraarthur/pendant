@@ -194,63 +194,94 @@ The 10 kΩ gate pull-up to 3V3_SYS clamps V_GS = 0 V during deep sleep
 
 ---
 
-## Subsystem E — UI (Buttons + WS2812B Ring)
+## Subsystem E — UI (Buttons + LED Ring)
 
-### Tactile Buttons
+### Tactile Buttons — Side-Mount (90° Right-Angle)
 
-Three SW_Push buttons with dedicated 10 kΩ hardware pull-ups to 3V3_SYS.
+Three side-mount tactile switches placed on the PCB edge, actuated from
+the pendant's perimeter. This allows button presses through the silicone
+overmold without top-surface PCB area.
 
-Hardware pull-ups are essential — the ESP32-S3 internal pull-ups (~45 kΩ)
-are disabled during deep sleep, leaving wake pins floating and vulnerable to
-EMI false-triggers. Physical resistors eliminate this ambiguity.
+**Recommended part:** ALPS SKRTLAE010 (4.5 × 3.4 × 3.3 mm, 1.6 N force,
+J-bend SMD right-angle). LCSC C110293, ~$0.06.
 
-| Button | GPIO | Net |
-|---|---|---|
-| BTN_MAIN | IO0 | GPIO_BTN_MAIN |
-| BTN_SYNC | IO1 | GPIO_BTN_SYNC |
-| BTN_BATT | IO9 | GPIO_BTN_BATT |
+Alternative (slimmer): ALPS SKSCLBE010 (3.5 × 3.5 × 1.1 mm). LCSC C115361.
 
-### WS2812B LED Ring — 8 pixels (FIX-002)
+PCB layout note: The 50 mm circular outline needs small flat edges or notches
+at each button position to provide solderable surface for the SMD pads.
 
-**Parts:** 8× WS2812B (LED_ARGB PLCC-4), BSS84 PMOS load switch, 10 kΩ gate pull-up
+Hardware pull-ups (10 kΩ to 3V3_SYS) remain essential — the ESP32-S3
+internal pull-ups (~45 kΩ) are disabled during deep sleep, leaving wake
+pins floating and vulnerable to EMI false-triggers.
 
-#### FIX-002 — Why a load switch is mandatory
+| Button | GPIO | Net | Position |
+|---|---|---|---|
+| BTN_MAIN | IO0 | GPIO_BTN_MAIN | Side (RTC-capable wake) |
+| BTN_SYNC | IO1 | GPIO_BTN_SYNC | Side |
+| BTN_BATT | IO9 | GPIO_BTN_BATT | Side |
 
-The WS2812B internal CMOS oscillator stays active even when all pixels are set
-to `0x000000` (black). This quiescent drain is 0.6–1.0 mA per pixel.
+### LED Ring — 8 pixels, SK6805-EC15 or WS2812C-2020 (FIX-002 + FIX-004)
+
+#### FIX-004 — WS2812B 5050 → smaller addressable RGB LEDs
+
+The WS2812B PLCC-4 (5.0 × 5.0 mm) is oversized for a 50 mm pendant.
+Replacing with smaller addressable RGB LEDs frees significant PCB area.
+
+| Option | Package | Area vs WS2812B | VDD min | mA/ch | LCSC Stock | Price |
+|--------|---------|-----------------|---------|-------|-----------|-------|
+| **SK6805-EC15** | **1.5 × 1.5 mm** | **10× smaller** | 3.5–3.7 V | 3 mA | C2890035 (272k) | $0.05 |
+| **WS2812C-2020-V1** | **2.0 × 2.0 mm** | **6× smaller** | 3.7 V | 5 mA | C2976072 (904k) | $0.04 |
+| WS2812B-2020 | 2.0 × 2.0 mm | 6× smaller | 3.7 V | 12 mA | C965555 (546k) | $0.04 |
+
+**Recommendation:** SK6805-EC15 (1.5 mm) for minimum footprint, or
+WS2812C-2020-V1 (2.0 mm) for best stock availability and easiest assembly.
+
+Both use the same NRZ single-wire protocol as WS2812B — **no firmware
+change required**. The SK6805-EC15 3 mA variant draws less power (8 × 3 ×
+3 mA = 72 mA full white vs 8 × 3 × 16 mA = 384 mA for WS2812B 5050).
+
+**Note on the privacy indicator LED:** The separate red 0603 LED on
+HONEST_MIC_PWR **must be kept**. It provides the hardware interlock
+guarantee — if you replace it with an addressable RGB LED, firmware could
+be modified to suppress the red indicator while the mic is on, breaking
+the core privacy promise. The red 0603 LED (1.6 × 0.8 mm) is already
+smaller than any addressable RGB option.
+
+#### FIX-002 — Load switch (unchanged)
+
+The PMOS load switch remains mandatory. Even the SK6805-EC15 draws
+quiescent current from its internal oscillator.
 
 | Scenario | Current | Standby life (400 mAh) |
 |---|---|---|
 | v2 (LEDs hardwired to 3V3) | ~4.87 mA total | **82 h (3.4 days)** |
-| v3 (PMOS load switch, FIX-002) | ~66 µA total | **~6 060 h (252 days)** |
-
-The load switch topology is identical to the mic interlock:
+| v3+ (PMOS load switch) | ~66 µA total | **~6 060 h (252 days)** |
 
 ```
-3V3_SYS ──[BSS84 S]──[D]──► LED_SWITCHED_PWR ──► WS2812B VDD (× 8)
+3V3_SYS ──[BSS84 S]──[D]──► LED_SWITCHED_PWR ──► SK6805-EC15 VDD (× 8)
               ▲ gate
          LED_VDD_EN_N (IO7)
          [10kΩ pull-up to 3V3]
 ```
 
-ESP32 drives IO7 LOW to power the ring; pull-up forces PMOS OFF during sleep.
+#### Voltage supply options
 
-#### InGaN supply warning
+No addressable RGB LED is rated below 3.5 V. At 3.3 V:
+- Red/green/amber: **work well** (LED Vf ~2.0–2.2 V, plenty of headroom)
+- Blue/white: **dim or unreliable** (InGaN Vf ~3.0–3.2 V, insufficient headroom)
 
-WS2812B datasheet specifies VDD_min = **3.5 V**. Running at 3.3 V_SYS leaves
-< 100 mV headroom for the blue/green InGaN internal current sinks. Blue/green
-channels may dim or flicker near end-of-battery-life.
+| Option | Approach | Trade-off |
+|--------|----------|-----------|
+| **A (simplest)** | Run at 3.3 V, use red/green/amber palette only | No extra parts. Blue unreliable. |
+| **B (recommended)** | Feed LED_SWITCHED_PWR from VBAT (3.0–4.2 V) | Full colour above 3.7 V (~70% of battery life). Blue fades = natural low-battery indicator. |
+| C (full colour) | Add TPS61023 boost to 5 V for LED rail only | Extra IC + inductor + caps. Full brightness all colours. |
 
-**Acceptable** at ≤ 30 % brightness for status indication.
-**Mitigation** (if full brightness required): route `LED_SWITCHED_PWR` from a
-5 V boost converter (e.g. TPS61023) instead of directly from 3V3_SYS.
-
-#### Daisy-chain wiring
+#### Daisy-chain wiring (unchanged protocol)
 
 ```
-IO8 ──► WS2812B[0] DOUT ──► WS2812B[1] DOUT ──► ... ──► WS2812B[7]
-         DIN                  DIN
-        (WS2812_DATA)        (WS2812_DOUT_0)   ...     (WS2812_DOUT_6)
+IO8 ──► LED[0] DOUT ──► LED[1] DOUT ──► ... ──► LED[7]
+         DIN              DIN
+        (WS2812_DATA)    (WS2812_DOUT_0)  ...  (WS2812_DOUT_6)
 ```
 
 ---
@@ -265,7 +296,7 @@ All figures are worst-case with load switches OFF.
 | TPS63031 | Power-save mode (no load) | 55 µA |
 | W25N02KV | Deep power-down | 1 µA |
 | TP4056 | Standby (VBUS absent) | 2 µA |
-| WS2812B × 8 | Load switch open | **0 µA** |
+| SK6805-EC15 × 8 | Load switch open | **0 µA** |
 | **Total** | | **66 µA** |
 
 `T_standby = 400 mAh / 0.066 mA ≈ 6 060 h ≈ 252 days` (zero-wake theoretical)
