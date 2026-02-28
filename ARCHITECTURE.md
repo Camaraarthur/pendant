@@ -317,6 +317,79 @@ in the standard KiCad 7/8 libraries.
 
 ---
 
+## Known Issues (v3 → v4 Candidates)
+
+Issues identified via deep design review. Must be fixed before fab.
+
+### ISSUE-001 — TPS63031 Missing Pin Connections (CRITICAL)
+
+The v3 netlist does not connect the TPS63031's **FB**, **VINA**, or **PGND** pins.
+
+- **FB** must connect directly to VOUT (3V3_SYS). This is how the internal
+  error amplifier senses the output voltage. Without it, the converter will
+  not regulate at all. This is the #1 documented TPS63031 mistake on TI's
+  E2E forums.
+- **VINA** is the internal analog supply rail. It requires a 100 nF ceramic
+  bypass capacitor to GND (max 220 nF). VINA must NOT be shorted to VIN
+  externally — there is an internal filter resistor.
+- **PGND** (power ground) carries the high-current switching return path.
+  If floating, the converter cannot operate.
+
+**Fix for netlist:**
+```python
+buckboost["FB"]   += vcc_3v3          # Fixed 3.3V output: FB senses VOUT
+buckboost["PGND"] += gnd              # Power ground
+c_vina = Part("Device", "C", footprint=FP_C0402, value="100n")
+c_vina[1] += buckboost["VINA"]; c_vina[2] += gnd
+```
+
+### ISSUE-002 — IM73D122 Missing Bypass Capacitor (HIGH)
+
+The IM73D122 datasheet specifies a 100 nF capacitor between VDD and GND
+for best performance. The HONEST_MIC_PWR rail has no local decoupling.
+Switching noise from the TPS63031 (2.4 MHz) will couple into the mic
+supply, degrading the 73 dB(A) SNR that makes this mic worth its cost.
+
+**Fix:** Add 100 nF between HONEST_MIC_PWR and GND, placed as close to
+the IM73D122 VDD pad as physically possible.
+
+### ISSUE-003 — No NTC Thermistor for Battery Temperature (SAFETY)
+
+The worst-case active dissipation is ~1.61 W inside a silicone shell with
+k ≈ 0.2 W/m·K. The TP4056 has no built-in temperature sensing. Without an
+NTC thermistor, firmware cannot implement the thermal throttling described
+in the architecture. This is a safety certification blocker (IEC 62133,
+UL 2054) for an encapsulated LiPo.
+
+**Fix:** Add a 10 kΩ NTC thermistor (B=3950) bonded to the cell or on the
+PCB near the battery connector. Connect as a voltage divider to an ESP32
+ADC input. Firmware must:
+- Pause charging (TP4056 CE low) when T > 45 °C
+- Halt Wi-Fi TX when T > 50 °C
+- Shutdown when T > 55 °C
+
+### ISSUE-004 — USB-C Missing ESD Protection (MEDIUM)
+
+No TVS diodes on CC1/CC2 lines. USB-C connectors see real-world ESD from
+cable insertion. The 5.1 kΩ pull-downs provide no current limiting for an
+ESD event (nanosecond timescale).
+
+**Fix:** Add a dual-channel TVS diode (PRTR5V0U2X or similar) across
+CC1/CC2 to GND, placed as close to the USB-C connector as possible.
+
+### ISSUE-005 — ESP32-S3 Antenna Keep-Out on 50 mm Circular PCB (LAYOUT)
+
+The ESP32-S3-WROOM-1 requires either antenna overhang past the PCB edge
+(no FR4 underneath) or a 15 mm keep-out zone around the antenna. On a
+50 mm diameter board, this is extremely tight after placing all components.
+
+**Options:**
+1. Position module at PCB edge with antenna overhanging the circle boundary
+2. Switch to ESP32-S3-WROOM-1U (U.FL connector) with external flex antenna
+3. Accept 3–6 dB RF penalty and plan for reduced range
+
+---
+
 ## ECO History
 
 | ID | Description |

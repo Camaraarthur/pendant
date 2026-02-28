@@ -136,6 +136,8 @@ firmware/
 │   ├── storage/
 │   │   ├── flash_storage.c         ← W25N02KV NAND: Dhara FTL + FATFS
 │   │   ├── flash_storage.h
+│   │   ├── crypto_storage.c        ← AES-256-GCM encrypt before NAND write (HW accelerated)
+│   │   ├── crypto_storage.h
 │   │   ├── recording_manager.c     ← Recording lifecycle (start → chunk → stop → index)
 │   │   └── recording_manager.h
 │   │
@@ -156,7 +158,9 @@ firmware/
 │   │   └── battery_monitor.h
 │   │
 │   ├── network/
-│   │   ├── wifi_sync.c             ← Wi-Fi STA mode, HTTPS upload, mDNS
+│   │   ├── wifi_provision.c        ← ESP-IDF wifi_prov_scheme_ble (not custom BLE)
+│   │   ├── wifi_provision.h
+│   │   ├── wifi_sync.c             ← Wi-Fi STA mode, HTTPS server, mDNS
 │   │   ├── wifi_sync.h
 │   │   ├── ota_update.c            ← OTA firmware updates via HTTPS
 │   │   └── ota_update.h
@@ -179,7 +183,7 @@ firmware/
 
 | Subsystem | ESP-IDF API | GPIOs | Implementation Notes |
 |-----------|-------------|-------|----------------------|
-| **PDM Microphone** | `i2s_new_channel()` + `i2s_channel_init_pdm_rx_mode()` | IO5 (CLK), IO6 (DATA) | **Must use I2S0** (only port supporting PDM RX). 16-bit @ 16 kHz mono. Use `I2S_PDM_RX_SLOT_PCM_FMT_DEFAULT_CONFIG` for hardware PDM→PCM conversion. DMA double-buffer via `i2s_channel_register_event_callback()` (preferred over blocking reads). Pin audio task to Core 0 to avoid Wi-Fi ISR jitter. |
+| **PDM Microphone** | `i2s_new_channel()` + `i2s_channel_init_pdm_rx_mode()` | IO5 (CLK), IO6 (DATA) | **Must use I2S0** (only port supporting PDM RX). 16-bit @ 16 kHz mono. `dma_frame_num=1024` (64 ms/buffer), `dma_desc_num=6` (384 ms total). DMA callback via `i2s_channel_register_event_callback()` (preferred over blocking reads). **Pin audio task to Core 1** — Wi-Fi ISRs live on Core 0 and cause cache eviction stalls. Mark all ISR-path functions with `IRAM_ATTR`. |
 | **QSPI NAND Flash** | `espressif/spi_nand_flash` component (v0.17+) | IO10 (CS), IO11 (MOSI/IO0), IO12 (CLK), IO13 (MISO/IO1), IO2 (WP/IO2), IO3 (HOLD/IO3) | **W25N02KV is officially supported** (W25N02KVxxIR/U listed since v0.14+). Architecture: App → FATFS → Dhara FTL (wear leveling + bad block mgmt) → SPI NAND driver → ESP-IDF SPI. Init: Standard SPI first → set SR3[1]=1 → Quad mode. Enable `NAND_FLASH_VERIFY_WRITE` in menuconfig during development. Add with `idf.py add-dependency "espressif/spi_nand_flash^0.17"`. |
 | **WS2812B LEDs** | `espressif/led_strip` component v3.x (RMT backend) | IO8 (DATA), IO7 (load switch) | Drive IO7 LOW first to power the ring via PMOS. **ESP32-S3 is the only chip with RMT DMA** — set `.flags.with_dma = true` for reliable operation alongside Wi-Fi. Use `rmt_transmit()` (v5.x encoder API, not deprecated `rmt_write_items()`). Pin LED task to Core 1. Keep brightness ≤ 30% at 3.3 V (WS2812B VDD_min is 3.5 V). `idf.py add-dependency "espressif/led_strip"`. |
 | **Buttons** | `gpio_install_isr_service()` + `esp_timer` | IO0 (MAIN), IO1 (SYNC), IO9 (BATT) | 20 ms software debounce via one-shot `esp_timer`. IO0 is RTC-capable: use `esp_sleep_enable_ext0_wakeup(GPIO_NUM_0, 0)` for deep sleep wake. |
@@ -192,16 +196,32 @@ firmware/
 ### Audio Pipeline
 
 ```
-IM73D122 (PDM) ──► I2S PDM RX (DMA) ──► PCM ring buffer (32 KB)
-                                              │
-                                         Opus encoder
-                                        (16 kHz mono, ~16 kbps)
-                                              │
-                                         NAND flash (FATFS)
-                                        /recordings/YYYYMMDD_HHMMSS.opus
-                                              │
-                                         Wi-Fi sync ──► phone / cloud
+IM73D122 (PDM) ──► I2S PDM RX (DMA, Core 1) ──► PCM ring buffer (32 KB)
+                                                       │
+                                                  Opus encoder
+                                                 (16 kHz mono, ~16 kbps)
+                                                       │
+                                                  AES-256-GCM encrypt
+                                                 (HW accelerated, <1% CPU)
+                                                       │
+                                                  NAND flash (FATFS)
+                                                 /recordings/YYYYMMDD_HHMMSS.opus.enc
+                                                       │
+                                                  Wi-Fi sync (HTTPS with Range headers)
+                                                       │
+                                                  Phone decrypts with key from HTTPS
 ```
+
+**Encryption at rest:** ESP32-S3's built-in XTS-AES flash encryption only
+covers the internal NOR flash, NOT external SPI NAND. Audio on the W25N02KV
+must be encrypted in software. Use `mbedtls_gcm_*` with
+`CONFIG_MBEDTLS_HARDWARE_AES=y` — the HW accelerator achieves ~300–425 KB/s,
+trivially fast for the 2 KB/s Opus stream (<1% CPU overhead). Store the
+master encryption key in NVS with NVS encryption enabled (covered by internal
+flash encryption). Per-recording keys derived via HKDF from master key +
+recording timestamp. During Wi-Fi sync, transfer encrypted files as-is; send
+the per-recording key over the TLS-protected HTTPS channel for phone-side
+decryption.
 
 **Storage math (2 Gb = 256 MB NAND):**
 
@@ -238,28 +258,105 @@ only used for firmware, NVS, and OTA.)
 ### FreeRTOS Task Architecture
 
 ```
-┌──────────────────────────────────────────────────┐
-│                  FreeRTOS (2 cores)               │
-│                                                    │
-│  Core 0 (PRO_CPU):                                │
-│    ├── audio_task    (priority 10, pinned)         │
-│    │   PDM capture → Opus encode → NAND write     │
-│    └── button_task   (priority 5)                  │
-│        GPIO ISR → debounce → state machine        │
-│                                                    │
-│  Core 1 (APP_CPU):                                │
-│    ├── wifi_task     (priority 8)                  │
-│    │   mDNS, HTTPS sync, OTA                      │
-│    ├── led_task      (priority 3)                  │
-│    │   Animation state → RMT write                │
-│    └── power_task    (priority 2)                  │
-│        Battery ADC, thermal throttle, sleep entry │
-│                                                    │
-│  Inter-task: FreeRTOS event groups + queues        │
-└──────────────────────────────────────────────────┘
+┌────────────────────────────────────────────────────────────┐
+│                    FreeRTOS (2 cores)                       │
+│                                                              │
+│  Core 0 (PRO_CPU) — Wi-Fi / system:                        │
+│    ├── wifi_task     (priority 8)                            │
+│    │   mDNS, HTTPS sync, OTA                                │
+│    ├── button_task   (priority 5)                            │
+│    │   GPIO ISR → debounce → state machine                  │
+│    └── power_task    (priority 2)                            │
+│        Battery ADC, NTC temp, thermal throttle, sleep entry │
+│                                                              │
+│  Core 1 (APP_CPU) — audio / UI:                             │
+│    ├── audio_task    (priority 10, pinned, 30 KB stack)     │
+│    │   I2S PDM RX → Opus encode → AES-GCM → NAND write    │
+│    └── led_task      (priority 3)                            │
+│        Animation state → RMT write                          │
+│                                                              │
+│  Inter-task: FreeRTOS event groups + queues                  │
+└────────────────────────────────────────────────────────────┘
 ```
 
-Pin audio capture to Core 0 to avoid Wi-Fi ISR jitter on the I2S DMA.
+**Critical: Audio must be on Core 1, not Core 0.** The ESP-IDF Wi-Fi
+protocol task runs on Core 0 by default (`CONFIG_ESP_WIFI_TASK_CORE_ID=0`)
+and its ISRs cannot be moved. Wi-Fi operations trigger SPI flash reads
+that evict cache lines — if the I2S DMA ISR shares Core 0, it stalls on
+cache misses and causes buffer overflows. Initialize I2S from the Core-1
+pinned audio task so the DMA interrupt is allocated on Core 1. Mark all
+ISR-path functions with `IRAM_ATTR`. Set `CONFIG_LWIP_TCPIP_TASK_AFFINITY=0`
+to keep the TCP/IP stack on Core 0 as well.
+
+Allocate **30 KB of stack** for the audio task — Opus uses `alloca`
+heavily and the default 4 KB FreeRTOS stack will overflow.
+
+### Power State Machine
+
+The pendant needs an explicit state machine. Without one, edge cases
+(accidental presses, low battery during recording, sync interrupts) cause
+undefined behavior.
+
+```
+                    ┌───────────┐
+          IO0 press │           │ no activity for 5 min
+     ┌─────────────►│   IDLE    │◄──────────────────────┐
+     │              │           │                        │
+     │              └─────┬─────┘                        │
+     │                    │                              │
+     │            IO0 long-press                         │
+     │              (1.5 s)                              │
+     │                    │                              │
+     │              ┌─────▼─────┐                        │
+     │              │           │    low battery         │
+     │              │ RECORDING ├───(graceful stop)──────┤
+     │              │           │                        │
+     │              └─────┬─────┘                        │
+     │                    │                              │
+     │            IO0 long-press                         │
+     │              (1.5 s)                              │
+     │                    │                              │
+     │              ┌─────▼─────┐                        │
+     │              │           │    IO1 short-press     │
+     │              │   IDLE    ├───────────────┐        │
+     │              │           │               │        │
+     │              └─────┬─────┘               │        │
+     │                    │            ┌────────▼──────┐ │
+     │              no activity        │               │ │
+     │              for 5 min          │   SYNCING     ├─┘
+     │                    │            │               │
+     │              ┌─────▼─────┐      └───────────────┘
+     │              │           │      (complete/timeout/error)
+     └──────────────┤ SLEEPING  │
+       IO0 press    │  (66 µA)  │
+       (wake)       └───────────┘
+```
+
+**Button handling for a wearable:**
+- **Long-press (1.5 s) to start/stop recording** — prevents accidental activation in pockets
+- **Short-press in any state** — show status on LED ring (battery level, recording state)
+- **Double-press protection** — ignore button presses for 500 ms after state change
+- **IO1 (SYNC) short-press** — initiate Wi-Fi sync (works while recording)
+- **IO9 (BATT) short-press** — flash battery level on LED ring (no state change)
+
+**PDM mic watchdog:** The IM73D122 has a known edge case where a sudden
+loud sound (>122 dB SPL) can drive the sigma-delta modulator into a limit
+cycle, locking PDM output to a fixed square wave. Firmware should monitor
+bitstream statistics — if no audio-like variation for >100 ms, toggle
+MIC_ENABLE_N (IO4) HIGH→LOW to power-cycle the mic (2 ms recovery).
+
+### Wi-Fi Provisioning
+
+Use ESP-IDF's built-in `wifi_prov_scheme_ble` instead of custom BLE
+provisioning. Advantages:
+- X25519 key exchange + proof-of-possession + AES-CTR encryption of credentials
+- Custom data endpoints (send device IP, firmware version alongside Wi-Fi creds)
+- ~110 KB BLE memory automatically reclaimed after provisioning via
+  `WIFI_PROV_SCHEME_BLE_EVENT_HANDLER_FREE_BTDM`
+- Official Espressif companion app protocol (or use your own Flutter app)
+
+Do NOT use SmartConfig (weak security, credentials travel over air) or
+SoftAP provisioning (unreliable radio sharing, worse UX).
 
 ### Build, Flash & Monitor
 
@@ -342,7 +439,7 @@ the device over the local Wi-Fi network.
 | BLE (pairing) | `flutter_blue_plus` | More stable than RN equivalents across Android/iOS device combinations |
 | mDNS discovery | `bonsoir` or `nsd` | Find pendant via `_honestpuck._tcp` on local network |
 | HTTPS client | `dio` | Interceptors, retry logic, chunked downloads |
-| Audio playback | `just_audio` + `just_audio_background` | Opus/FLAC support, background playback, lock screen controls, seeking, speed adjust |
+| Audio playback | `just_audio` + `just_audio_background` + `ffmpeg_kit_flutter` | Android plays .opus natively. **iOS cannot play Opus** (AVFoundation limitation) — remux to .caf container on download via ffmpeg_kit (lossless, instant). See note below. |
 | Local DB | `drift` (SQLite) | Type-safe, reactive, code-generated from schema |
 | State management | `riverpod` | Mature, testable, compile-time safety |
 | File system | `path_provider` + `dart:io` | Save downloaded .opus files to app sandbox |
@@ -359,16 +456,56 @@ the device over the local Wi-Fi network.
 | State management | `zustand` | Lightweight, no boilerplate |
 | File system | `expo-file-system` or `react-native-fs` | Save downloaded .opus files to app sandbox |
 
+### iOS Opus Playback Workaround
+
+iOS/AVFoundation does **not** support Opus in `.ogg` or `.opus` containers.
+Android works natively. The fix:
+
+```dart
+// After downloading .opus from pendant:
+if (Platform.isIOS) {
+  // Remux to .caf (Core Audio Format) — container change only, lossless, instant
+  await FFmpegKit.execute('-i $opusPath -c copy $cafPath');
+  await player.setFilePath(cafPath);
+} else {
+  await player.setFilePath(opusPath);  // Android plays .opus directly
+}
+```
+
+This adds ~8 MB to the iOS app binary (ffmpeg_kit_flutter). The alternative
+is `flutter_opus` (FFI to libopus), which decodes to PCM — smaller but more
+complex to maintain.
+
+### On-Device Transcription (Default)
+
+For a privacy-first product, transcription should default to **on-device**
+with cloud as an explicit opt-in:
+
+| Tier | Engine | Privacy | Performance |
+|------|--------|---------|-------------|
+| **Tier 1 (default)** | `whisper.cpp` on phone via `dart:ffi` | Audio never leaves phone | whisper-small: ~3–5 min per 1 hr audio on 2023+ phone |
+| Tier 2 (opt-in) | Deepgram Nova-3 API ($0.0043/min) | TLS in transit, processed on their servers | Near-realtime, built-in diarization |
+| Tier 3 (enterprise) | Self-hosted Whisper on GPU | Full data sovereignty | Depends on GPU instance |
+
+Ship the quantized `ggml-small-q5_1` model (~250 MB) as a downloadable
+asset, not bundled in the app binary. CoreML acceleration on iOS,
+NNAPI on Android.
+
 ### Screens
 
 | Screen | Purpose | Key Interactions |
 |--------|---------|------------------|
-| **Onboarding / Pairing** | First-time setup. BLE scan → find pendant → exchange Wi-Fi credentials → verify mDNS connection | One-time flow, stored in SQLite |
+| **Onboarding / Pairing** | First-time setup. BLE scan → find pendant → exchange Wi-Fi credentials → verify connection | One-time flow, stored in SQLite |
 | **Recordings** | List synced audio files. Playback with waveform. Swipe to delete. Filter by date. | Pull-to-refresh triggers sync |
 | **Device Status** | Battery %, NAND storage used/free, firmware version, recording count on device | Auto-refresh on screen focus |
 | **Settings** | Wi-Fi config, audio quality (Opus bitrate), auto-sync toggle, privacy policy link, firmware update trigger | Persisted in SQLite |
 
 ### Pairing Flow (BLE → Wi-Fi Handoff)
+
+mDNS is unreliable on many Android devices (< Android 13) and on corporate
+networks that block multicast. The primary discovery mechanism is **BLE IP
+relay**: the ESP32 sends its DHCP-assigned IP address over BLE during
+provisioning. mDNS serves only as a fallback.
 
 ```
 Phone                          Pendant (ESP32-S3)
@@ -376,20 +513,27 @@ Phone                          Pendant (ESP32-S3)
   │──── BLE scan ────────────────────►│
   │◄─── Advertise "HonestPuck-XXXX" ─│
   │                                   │
-  │──── BLE connect ─────────────────►│
-  │──── Write Wi-Fi SSID + PSK ──────►│  (encrypted BLE characteristic)
+  │──── BLE connect (wifi_prov) ─────►│
+  │──── Send Wi-Fi SSID + PSK ──────►│  (X25519 encrypted via wifi_prov)
   │                                   │
   │     ESP32 connects to Wi-Fi       │
-  │     ESP32 starts mDNS             │
+  │     ESP32 gets IP from DHCP       │
+  │     ESP32 starts mDNS + HTTPS     │
   │                                   │
-  │◄─── BLE notify: "Wi-Fi OK" ──────│
-  │──── BLE disconnect ──────────────►│
+  │◄─── BLE notify: IP + port ───────│  ← KEY: send assigned IP over BLE
+  │──── BLE disconnect ──────────────►│  (BLE memory freed: ~110 KB)
   │                                   │
-  │──── mDNS resolve ────────────────►│  (_honestpuck._tcp → 192.168.x.x)
-  │◄─── HTTPS handshake ─────────────│
+  │──── HTTPS connect to IP:port ────►│  ← Direct connection, no mDNS needed
+  │◄─── TLS handshake ───────────────│
   │                                   │
+  │     Store IP in SQLite            │  ← Cache for future connections
   │     All future comms via Wi-Fi    │
 ```
+
+**Reconnection priority:**
+1. Cached IP from SQLite (2-second timeout)
+2. mDNS fallback via `bonsoir` (`_honestpuck._tcp`)
+3. Re-pair via BLE if both fail
 
 ---
 
@@ -630,8 +774,8 @@ feature branch ──► PR ──► CI green ──► merge to main
 │                    FIRMWARE (ESP-IDF v5.5+)                       │
 │                                                                    │
 │   FreeRTOS tasks on dual-core Xtensa LX7:                        │
-│    Core 0: PDM audio capture (I2S DMA) → Opus encode → NAND     │
-│    Core 1: Wi-Fi STA (mDNS + HTTPS) / LED (RMT) / buttons       │
+│    Core 0: Wi-Fi STA (mDNS + HTTPS) / buttons / power mgmt      │
+│    Core 1: PDM capture → Opus → AES-GCM → NAND / LED (RMT)     │
 │                                                                    │
 │   Key components:                                                 │
 │    • espressif/spi_nand_flash v0.17+ (W25N02KV, Dhara FTL)      │
@@ -785,16 +929,20 @@ Violating any of them breaks the product.
 
 | # | Constraint | Impact | Layer |
 |---|------------|--------|-------|
-| 1 | **66 µA deep sleep budget** | Firmware must gate IO4 and IO7 HIGH (via Hi-Z + pull-ups) before `esp_deep_sleep_start()` | Firmware |
+| 1 | **66 µA deep sleep budget** | Firmware must gate IO4 and IO7 HIGH (via Hi-Z + pull-ups), call `rtc_gpio_isolate()` on unused RTC GPIOs, `esp_wifi_stop()` explicitly before `esp_deep_sleep_start()` | Firmware |
 | 2 | **Privacy interlock (IO4)** | Mic VDD and red LED share HONEST_MIC_PWR copper trace. Firmware must never bypass this — no separate LED control. | Firmware |
 | 3 | **WS2812B at 3.3 V** (spec min 3.5 V) | Blue/green channels dim or flicker below 3.4 V. Limit brightness to ≤ 30%. Use warm white / red / amber for reliable status indication. | Firmware + App |
 | 4 | **QSPI init sequence** | Must start in Standard SPI mode → write W25N02KV SR3[1]=1 → switch to Quad mode. Reversing this bricks the flash session. | Firmware driver |
-| 5 | **1.61 W thermal ceiling** | Never run TP4056 charging + ESP32 Wi-Fi TX simultaneously at full power. Firmware must check VBUS presence and throttle Wi-Fi or pause charging. LiPo must stay < 60 °C. | Firmware |
+| 5 | **1.61 W thermal ceiling** | Never run TP4056 charging + ESP32 Wi-Fi TX simultaneously at full power. NTC thermistor must be added (ISSUE-003). Firmware must pause charging at 45 °C, halt Wi-Fi TX at 50 °C. | Firmware + HW |
 | 6 | **400 mAh / 0.75 C charge rate** | Charge current is fixed at 300 mA by the 4 kΩ PROG resistor (hardware). Not configurable in firmware. | Hardware |
-| 7 | **50 mm × 15 mm form factor** | PCB must fit circular outline. Silicone mold limits heat dissipation (k ≈ 0.2 W/m·K). All components on one side preferred for thinner build. | Hardware / Mechanical |
-| 8 | **2 Gb NAND = 256 MB** | At 16 kHz 16-bit mono raw PCM: ~2.2 hours. With Opus @ 16 kbps: ~35 hours. Firmware must manage storage, delete oldest recordings when full (or warn user). | Firmware + App |
+| 7 | **50 mm × 15 mm form factor** | PCB must fit circular outline. Antenna keep-out requires module at board edge or overhang (ISSUE-005). | Hardware / Mechanical |
+| 8 | **2 Gb NAND = 256 MB** | With Opus @ 16 kbps + AES overhead: ~35 hours. Wear: ~1,200 years at 8 h/day (non-issue). Firmware must manage storage and use TRIM on deletion. | Firmware + App |
 | 9 | **OTA partition size: 1.75 MB** | Firmware binary must stay under 1.75 MB to fit in an OTA partition. Monitor binary size in CI. | Firmware + CI |
-| 10 | **IM73D122 bottom-port acoustic** | PCB needs an unobstructed acoustic hole aligned with the mic port. Silicone overmold must not block this path. | Hardware / Mechanical |
+| 10 | **IM73D122 bottom-port acoustic** | PCB needs an unobstructed acoustic hole. Silicone overmold must not block. Add 100 nF bypass cap on HONEST_MIC_PWR (ISSUE-002). | Hardware / Mechanical |
+| 11 | **Audio on Core 1, Wi-Fi on Core 0** | Wi-Fi ISRs on Core 0 cause cache evictions. I2S DMA ISR must be on Core 1 to avoid buffer overflows. All ISR-path code needs `IRAM_ATTR`. | Firmware |
+| 12 | **iOS Opus playback** | AVFoundation cannot play .opus/.ogg. Remux to .caf container via ffmpeg_kit on download (lossless, instant). | App |
+| 13 | **TPS63031 missing FB/VINA/PGND** | Netlist v3 does not connect these pins — converter will not regulate. Must fix before fab (ISSUE-001). | Hardware |
+| 14 | **USB-C ESD protection** | No TVS diodes on CC1/CC2. Add dual-channel TVS near connector for field reliability (ISSUE-004). | Hardware |
 
 ---
 
@@ -821,7 +969,7 @@ Violating any of them breaks the product.
 
 | Layer | Status | What's Needed | Estimated Effort |
 |-------|--------|---------------|------------------|
-| **Hardware netlist** | **Done** (v3, 91 tests passing) | — | — |
+| **Hardware netlist** | **v3 done, v4 needed** (5 issues found — see ARCHITECTURE.md) | Fix TPS63031 pins, add mic bypass cap, NTC thermistor, ESD TVS | 1–2 days |
 | **PCB layout** | Not started | KiCad routing on 4-layer 50 mm circular board, DRC, Gerber export, fab order | 2–3 days (experienced), 1–2 weeks (learning KiCad) |
 | **Firmware** | Not started | ESP-IDF project, 8+ modules (audio, storage, privacy, UI, power, network, OTA) | Core functionality: 3–4 weeks. Polish + OTA: 2 more weeks. |
 | **Companion app** | Not started | React Native or Flutter, 4 screens, BLE pairing, mDNS sync, audio playback | 2–3 weeks |
