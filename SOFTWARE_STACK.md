@@ -213,11 +213,13 @@ IM73D122 (PDM) ──► I2S PDM RX (DMA) ──► PCM ring buffer (32 KB)
 
 Opus is the clear winner — it's royalty-free, handles speech extremely well at
 low bitrates, and Espressif provides an official `esp_audio_codec` component
-(v2.3+) with native Opus support. On ESP32-S3 (Xtensa LX7 @ 240 MHz), 16 kHz
-mono encoding at complexity 1–2 runs comfortably in real-time on a single core
-(~30–40% CPU utilisation). Alternative: `esphome/micro-opus` (lightweight,
-benchmarks show 22.8x real-time decode on S3). Add with:
-`idf.py add-dependency "espressif/esp_audio_codec"`.
+(v2.3+) with native Opus support. On original ESP32 (LX6 @ 240 MHz), 16 kHz
+mono encoding at complexity 1 uses ~70–80% of one core. The ESP32-S3 (LX7)
+has improved DSP instructions — expect ~50–60% of Core 0 at complexity 1,
+leaving headroom for I2S DMA and ring buffer management. **Use the
+fixed-point build** (`FIXED_POINT=1`) — the ESP32's FPU is slower than
+integer for Opus math. Keep frame size at 20 ms and complexity ≤ 2.
+Add with: `idf.py add-dependency "espressif/esp_audio_codec"`.
 
 ### Partition Table
 
