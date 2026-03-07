@@ -284,6 +284,85 @@ IO8 ──► LED[0] DOUT ──► LED[1] DOUT ──► ... ──► LED[7]
         (WS2812_DATA)    (WS2812_DOUT_0)  ...  (WS2812_DOUT_6)
 ```
 
+#### Alternative: Off-Board LED Ring (Recommended)
+
+Instead of soldering 8 addressable LEDs + 8 decoupling caps onto the
+already-crowded 50 mm main PCB, use **pre-made or custom LED ring PCBs**
+mounted above and/or below the main board on standoffs or spacers.
+
+**Why this is better:**
+
+- Frees significant main-PCB area (no 8× LED + 8× cap footprints)
+- Elevated ring creates a halo effect visible through translucent enclosure
+- Only 3 wires from main PCB: VDD, GND, DIN (one GPIO)
+- Ring is replaceable without reworking the main board
+- Dual-sided mounting gives visibility from both faces of the pendant
+
+**Ring sizing:**
+
+The main PCB is 50 mm diameter. A ~40 mm ring sits inside the board
+outline with clearance. Standard off-the-shelf sizes:
+
+| LEDs | Outer Ø | Source |
+|------|---------|--------|
+| 8 | ~32 mm | Generic WS2812B rings (Amazon, AliExpress) |
+| 12 | ~50 mm | Adafruit NeoPixel Ring, BTF-Lighting |
+
+A custom 40 mm ring PCB with 8–10 LEDs is straightforward — it's just
+a circular PCB with daisy-chained addressable LEDs, no active components.
+
+**Dual-ring wiring (top + bottom):**
+
+Two rings daisy-chained on one data line. The ESP32 sees LEDs 0–7 as
+Ring A (top) and LEDs 8–15 as Ring B (bottom). Still one GPIO pin.
+
+```
+                 ┌─── Ring A (top, 8 LEDs) ───┐
+                 │        3-wire cable         │
+ESP32  ┌─────────┴──────────────────────────┴──────┐
+IO8 ──►│ [SN74LVC1T45]──► Ring A DIN               │
+       │                   Ring A DOUT ─┐           │  Main PCB
+       │                                │ (via/     │  (50 mm)
+       │                   Ring B DIN ◄─┘  cable)   │
+       │                   Ring B DOUT ──► (NC)     │
+       └─────────┬──────────────────────────┬──────┘
+                 │        3-wire cable         │
+                 └─── Ring B (bottom, 8 LEDs)─┘
+```
+
+**Power supply for off-board rings:**
+
+Since these rings run at 5 V (WS2812B min 3.5 V, SK6812 min 3.7 V),
+power them from **USB VBUS (5 V)** through the PMOS load switch. The
+data line needs a level shifter (SN74LVC1T45 in SOT-23-5, ~$0.10)
+to shift the ESP32's 3.3 V IO8 output to 5 V logic.
+
+When running on battery only (no USB), use Option B from above:
+feed from VBAT (3.0–4.2 V). Full colour works above ~3.7 V; blue
+fades at low battery as a natural indicator.
+
+| Mode | Ring VDD | Colour range | Notes |
+|------|----------|-------------|-------|
+| USB plugged in | 5 V (VBUS) | Full RGB, full brightness | Best case |
+| Battery > 3.7 V | VBAT | Full RGB, slightly dimmer | ~70% of battery life |
+| Battery < 3.7 V | VBAT | Red/green/amber only | Blue Vf not met |
+
+**Privacy LED coordination:**
+
+When recording starts, firmware sets both:
+1. **Hardware red 0603 LED** — GPIO-driven, fail-safe, independent of ring
+2. **All ring LEDs to red** — software-driven reinforcement
+
+The ring LEDs turning red dramatically increases visibility from all
+angles, but the hardwired 0603 remains the legal compliance guarantee.
+The ring is a UX enhancement; the 0603 is the safety net.
+
+**Off-the-shelf ring options:**
+
+- [Adafruit NeoPixel Ring 12×](https://www.adafruit.com/product/1643) — 50 mm, $7.50
+- [Amazon WS2812B 8-LED Ring](https://www.amazon.com/WS2812B-Addressable-Modules-WS2812-Circle/dp/B09NGY2984) — ~32 mm, ~$3
+- [BTF-Lighting Ring Sets](https://www.btf-lighting.com/products/ws2812b-diy-rgb-led-ring-148-to-241-pixels-ws2812-round-modules-sk6812-5050-built-in-rgb-addressable-5v-led-circle-arduino-ring) — various sizes, ~$5
+
 ---
 
 ## Deep Sleep Power Budget
